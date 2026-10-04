@@ -1,0 +1,13 @@
+# OpenTofu / Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.example.tfvars
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
