@@ -1,0 +1,17 @@
+# Example remote backend configuration for Google Cloud Storage (GCS).
+#
+# To migrate from local state to remote GCS backend:
+# 1. Create a GCS bucket for Terraform state (e.g. gs://<PROJECT_ID>-tfstate-dev)
+#    with Object Versioning enabled and Uniform Bucket-Level Access enforced.
+# 2. Copy this file to backend.tf:
+#      cp backend.tf.example backend.tf
+# 3. Update the `bucket` value below with your bucket name.
+# 4. Initialize and migrate state:
+#      tofu init -migrate-state
+#
+terraform {
+  backend "gcs" {
+    bucket = "my-dev-tfstate-bucket"
+    prefix = "terraform/state/dev"
+  }
+}

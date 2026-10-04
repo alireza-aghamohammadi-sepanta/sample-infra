@@ -1,0 +1,19 @@
+# Example variable assignments for development environment.
+#
+# Copy this file to terraform.tfvars and customize for your GCP environment:
+#   cp terraform.tfvars.example terraform.tfvars
+
+project_id = "my-gcp-project-dev"
+region     = "us-central1"
+
+# Container images (optional - defaults to us-docker.pkg.dev/cloudrun/container/hello)
+# backend_image  = "us-central1-docker.pkg.dev/my-gcp-project-dev/app-images/backend:latest"
+# frontend_image = "us-central1-docker.pkg.dev/my-gcp-project-dev/app-images/frontend:latest"
+# migrator_image = "us-central1-docker.pkg.dev/my-gcp-project-dev/app-images/backend:latest"
+
+# Cloud SQL PostgreSQL database configuration (optional)
+# database_name = "sampledb"
+# db_tier       = "db-f1-micro"
+
+# Cloud Storage bucket for assets (optional - defaults to <project_id>-assets)
+# bucket_name = "my-gcp-project-dev-assets"
