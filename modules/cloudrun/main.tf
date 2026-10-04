@@ -16,11 +16,10 @@ locals {
 }
 
 resource "google_cloud_run_v2_service" "backend" {
-  name                = var.backend_service_name
-  location            = var.region
-  project             = var.project_id
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = var.deletion_protection
+  name     = var.backend_service_name
+  location = var.region
+  project  = var.project_id
+  ingress  = "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account = var.backend_sa_email
@@ -77,11 +76,10 @@ resource "google_cloud_run_v2_service_iam_member" "backend_invoker" {
 }
 
 resource "google_cloud_run_v2_service" "frontend" {
-  name                = var.frontend_service_name
-  location            = var.region
-  project             = var.project_id
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = var.deletion_protection
+  name     = var.frontend_service_name
+  location = var.region
+  project  = var.project_id
+  ingress  = "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account = var.frontend_sa_email
@@ -118,10 +116,9 @@ resource "google_cloud_run_v2_service_iam_member" "frontend_invoker" {
 }
 
 resource "google_cloud_run_v2_job" "migration" {
-  name                = var.migration_job_name
-  location            = var.region
-  project             = var.project_id
-  deletion_protection = var.deletion_protection
+  name     = var.migration_job_name
+  location = var.region
+  project  = var.project_id
 
   template {
     template {
