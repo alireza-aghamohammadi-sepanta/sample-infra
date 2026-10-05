@@ -1,69 +1,76 @@
 ---
 type: concept
 title: Container Runtimes and Compute Services
-summary: Serverless container compute specifications on Google Cloud Run for backend API and frontend static delivery services.
-related: ["architecture.md", "networking.md", "security.md", "deployment.md"]
-source_paths: []
+summary: Serverless Cloud Run v2 services and database migration jobs provisioned via OpenTofu.
+related: ["architecture.md", "networking.md", "security.md", "database.md", "deployment.md"]
+source_paths: ["modules/cloudrun/main.tf", "modules/cloudrun/variables.tf", "modules/cloudrun/outputs.tf", "modules/cloudrun/tests/cloudrun_validation.tftest.hcl", "tests/test_cloudrun_module.py"]
 ---
 
 # Container Runtimes and Compute Services
 
-The compute tier relies on **Google Cloud Run**, a managed serverless platform that runs stateless containers directly on top of Google Cloud's infrastructure. It provides automatic horizontal scaling, scale-to-zero capabilities, request-based autoscaling, and managed TLS termination.
+The compute tier is encapsulated in `modules/cloudrun`. It provisions serverless container workloads using Google Cloud Run v2 resources, managing the lifecycle of web-facing services and isolated batch jobs.
+
+## Module Resources
+
+The module declares three primary GCP resources:
+
+1. `google_cloud_run_v2_service.backend`: Asynchronous FastAPI REST API service.
+2. `google_cloud_run_v2_service.frontend`: Single-page application static web server.
+3. `google_cloud_run_v2_job.migration`: Batch job executing Alembic database migrations.
+
+Additionally, public HTTP access is granted by attaching `google_cloud_run_v2_service_iam_member` resources binding role `roles/run.invoker` to `allUsers` for both frontend and backend services.
 
 ## Service Specifications
 
-The system defines two primary Cloud Run services corresponding to the frontend and backend microservices:
+| Parameter | Frontend Service (`sample-frontend`) | Backend Service (`sample-backend`) | Migration Job (`sample-migration`) |
+| :--- | :--- | :--- | :--- |
+| **Resource Type** | `google_cloud_run_v2_service` | `google_cloud_run_v2_service` | `google_cloud_run_v2_job` |
+| **Listening Port** | `8080` | `8000` | N/A (Batch process) |
+| **Service Account** | `var.frontend_sa_email` | `var.backend_sa_email` | `var.migrator_sa_email` |
+| **Ingress Mode** | `INGRESS_TRAFFIC_ALL` | `INGRESS_TRAFFIC_ALL` | N/A |
+| **Scaling Limits** | `min_instance_count`: 0, `max_instance_count`: 10 | `min_instance_count`: 0, `max_instance_count`: 10 | Executes on demand |
+| **Entrypoint Command** | Default container entrypoint | Default container entrypoint | `["alembic", "upgrade", "head"]` |
 
-| Parameter | Frontend Service (`sample-frontend`) | Backend Service (`sample-backend`) |
-| :--- | :--- | :--- |
-| **Container Image** | Built from `nginxinc/nginx-unprivileged:alpine` | Built from `ghcr.io/astral-sh/uv:python3.13-bookworm-slim` |
-| **Listening Port** | `8080` (Nginx unprivileged standard) | `8080` / `8000` (FastAPI / Uvicorn standard) |
-| **CPU Allocation** | 1 vCPU | 1 to 2 vCPU |
-| **Memory Allocation** | 256 MiB | 512 MiB to 1 GiB |
-| **Concurrency** | Up to 1000 concurrent requests | 80 concurrent requests per container instance |
-| **Min Instances** | 0 (Scale-to-zero for dev/staging) / 1 (Prod) | 0 (Dev) / 1 (Prod to mitigate cold starts) |
-| **Max Instances** | 10 to 50 | 20 to 100 |
-| **Execution Environment** | Second generation (standard) | Second generation (supports Unix sockets & gVisor) |
-| **Service Identity** | Frontend runtime service account | Backend API service account with IAM bindings |
+## Environment Variables Configuration
 
-## Backend Runtime Profile
+### Backend Service Environment
+The backend service automatically receives database connection details and project metadata:
+- `DATABASE_INSTANCE`: Cloud SQL instance connection name (format: `project:region:instance`).
+- `DB_USER`: IAM database username, formatted by trimming `.gserviceaccount.com` from `backend_sa_email`.
+- `DB_NAME`: Target database name (e.g. `postgres` or `sampledb`).
+- `GCP_PROJECT_ID`: Target GCP project identifier.
+- Dynamic key-value pairs passed via `var.backend_env_vars` (such as `GCS_BUCKET_NAME`).
 
-The backend service runs a FastAPI application packaged using Astral `uv`:
+### Migration Job Environment
+The migration job receives the same database targeting variables:
+- `DATABASE_INSTANCE`: Cloud SQL instance connection name.
+- `DB_USER`: IAM database username, trimmed from `migrator_sa_email`.
+- `DB_NAME`: Target database name.
+- Dynamic environment variables passed via `var.migration_env_vars`.
 
-```
-+-------------------------------------------------------------+
-| Cloud Run Container Instance: sample-backend                |
-|                                                             |
-|  +-------------------------------------------------------+  |
-|  | Entrypoint: uvicorn main:app --host 0.0.0.0 --port 8080 |  |
-|  +-------------------------------------------------------+  |
-|                             |                               |
-|        +--------------------+--------------------+          |
-|        |                                         |          |
-|        v                                         v          |
-|  +---------------------------+       +-------------------+  |
-|  | Cloud SQL Python Connector|       | GCS Storage Client|  |
-|  | - IAM Authentication      |       | - V4 Presigned URL|  |
-|  | - Unix Socket / Loopback  |       +-------------------+  |
-|  +---------------------------+                              |
-+-------------------------------------------------------------+
-```
+## Module Inputs & Outputs
 
-### Key Runtime Behaviors
-- **Connection Handling:** Database connectivity is initialized lazily during application lifespan via the Cloud SQL Python Connector or direct async connection pool.
-- **Resource Constraints:** Non-blocking asynchronous I/O allows a single container to process high volumes of concurrent HTTP requests without thread starvation.
-- **Health Checks:** Cloud Run monitors HTTP startup probes and liveness probes at the root or `/docs` endpoint to ensure container readiness prior to routing incoming traffic.
+### Key Input Variables
+- `project_id` (string, required): The GCP project ID where Cloud Run resources are provisioned.
+- `region` (string, required): The GCP region for the Cloud Run resources.
+- `backend_image` (string, required): Container image URL for the backend service.
+- `frontend_image` (string, required): Container image URL for the frontend service.
+- `migrator_image` (string, optional): Container image URL for the migration job (defaults to `backend_image`).
+- `backend_sa_email`, `frontend_sa_email`, `migrator_sa_email` (string, required): Service account emails.
+- `database_instance` / `database_instance_connection_name` (string, optional): Cloud SQL connection name.
+- `database_name` (string, optional, default: `"postgres"`): PostgreSQL database name.
+- `min_instance_count` (number, default: 0) and `max_instance_count` (number, default: 10): Service instance limits.
+- `deletion_protection` (bool, default: `false`): Deletion protection toggle.
 
-## Frontend Runtime Profile
+### Module Outputs
+- `backend_url`: Public HTTPS URL of the backend service (`google_cloud_run_v2_service.backend.uri`).
+- `frontend_url`: Public HTTPS URL of the frontend service (`google_cloud_run_v2_service.frontend.uri`).
+- `migration_job_name`: Identifier of the migration job (`google_cloud_run_v2_job.migration.name`).
+- `backend_service_name`, `frontend_service_name`: Resource names for the services.
+- `backend_service_id`, `frontend_service_id`, `migration_job_id`: Fully qualified resource identifiers.
 
-The frontend service serves the pre-compiled Vite React SPA:
-- **Web Server:** Unprivileged Nginx listening on port 8080.
-- **SPA Routing:** Configured with fallback rewrite rules (`try_files $uri $uri/ /index.html`) to support client-side HTML5 history routing without 404 errors.
-- **Static Asset Optimization:** In-memory gzip compression enabled for JavaScript, CSS, and SVG payloads.
-- **Caching Headers:** Immutable cache headers for fingerprinted assets in `/assets/` and short-lived or no-cache headers for `index.html`.
+## Validation & Testing
 
-## Autoscaling & Revision Management
-
-- **Scale to Zero:** Cloud Run automatically scales instances to zero during idle periods to reduce operational expenditure.
-- **Cold-Start Mitigation:** For production tiers, `min_instances = 1` can be designated on the backend service to guarantee instantaneous response times for interactive user requests.
-- **Blue-Green Deployments:** Each container image deployment creates a unique, immutable Cloud Run revision. Traffic can be migrated instantly or split proportionally (canary release) using native Cloud Run traffic allocation rules.
+The module's correctness is validated through two complementary test layers:
+- **OpenTofu Test Suite** (`modules/cloudrun/tests/cloudrun_validation.tftest.hcl`): Mocks the Google provider and validates scaling parameters, port assignments (8000 for backend, 8080 for frontend), public invoker bindings, and migration job entrypoint commands during speculative plan execution.
+- **Python Integration Tests** (`tests/test_cloudrun_module.py`): Verifies required variable declarations without default values, resource definitions, environment variable propagation, and executes `tofu fmt` and `tofu validate`.

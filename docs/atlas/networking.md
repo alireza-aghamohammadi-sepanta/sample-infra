@@ -1,24 +1,24 @@
 ---
 type: concept
 title: Networking and Traffic Management
-summary: Ingress routing, TLS certificate management, Serverless VPC Access, and private network integration.
-related: ["architecture.md", "compute.md", "security.md"]
-source_paths: []
+summary: Ingress routing, public IPv4 Cloud SQL connectivity with mTLS, and cross-origin resource sharing.
+related: ["architecture.md", "compute.md", "database.md", "storage.md"]
+source_paths: ["modules/cloudrun/main.tf", "modules/cloudsql/main.tf", "modules/storage/main.tf"]
 ---
 
 # Networking and Traffic Management
 
-The networking architecture manages traffic ingress from public clients, internal communication between serverless containers and private relational databases, and secure egress to Google Cloud storage endpoints.
+The networking configuration of `sample-infra` balances simplicity, serverless scalability, and strong encryption. It governs external ingress, communication between Cloud Run and Cloud SQL, and cross-origin resource sharing for storage assets.
 
-## Ingress & Edge Routing
+## External Ingress & Edge Routing
 
-All external client traffic enters Google Cloud through Google's global edge network:
+All external client traffic reaches the application stack through Google's global edge network:
 
 ```
 +--------------------------------------------------------------------------------+
 |                             Google Edge Network                                |
-|  - Managed TLS Termination (TLS 1.3 / HTTP/2)                                  |
-|  - Anycast Global IPs / DNS Anycast Routing                                    |
+|  - Managed TLS Termination (HTTPS)                                             |
+|  - Ingress Policy: INGRESS_TRAFFIC_ALL                                         |
 +---------------------------------------+----------------------------------------+
                                         |
                  +----------------------+----------------------+
@@ -26,51 +26,51 @@ All external client traffic enters Google Cloud through Google's global edge net
                  v                                             v
 +---------------------------------+           +----------------------------------+
 | Frontend Ingress (Cloud Run)    |           | Backend Ingress (Cloud Run)      |
-| https://app.example.com         |           | https://api.example.com          |
-| (or https://frontend-*.run.app) |           | (or https://backend-*.run.app)   |
+| - Port: 8080                    |           | - Port: 8000                     |
+| - roles/run.invoker to allUsers |           | - roles/run.invoker to allUsers  |
+| - Output: frontend_url          |           | - Output: backend_url            |
 +---------------------------------+           +----------------------------------+
 ```
 
 ### Ingress Features
-- **Automated TLS Certificates:** Google-managed SSL/TLS certificates handle automatic provisioning and renewal without manual certificate management.
-- **Custom Domains:** Supports direct Cloud Run domain mappings or upstream integration with a Google Cloud External HTTP(S) Load Balancer for multi-region routing, Cloud CDN caching, and Cloud Armor DDoS protection.
-- **Protocol Support:** Native support for HTTP/2, WebSockets, and standard HTTP/1.1 streaming.
+- **Traffic Mode:** Both `frontend` and `backend` services set `ingress = "INGRESS_TRAFFIC_ALL"`.
+- **Port Mapping:** The frontend container exposes port `8080` (standard for unprivileged Nginx) and the backend container exposes port `8000` (FastAPI standard).
+- **Public Authorization:** Public invoker IAM policy bindings (`roles/run.invoker` for `allUsers`) permit unauthenticated edge traffic to reach both services.
+- **Automated TLS:** HTTPS certificates and TLS handshakes are managed automatically by Google Cloud infrastructure.
 
-## Serverless VPC Access & Private Networking
+## Cloud SQL Connectivity Architecture
 
-To isolate the relational database from public internet exposure, Cloud SQL is deployed with a Private IP address within a Virtual Private Cloud (VPC) network. Cloud Run connects to this private network using a **Serverless VPC Access Connector**:
+Unlike traditional VPC-peered deployments that require a Serverless VPC Access connector, this architecture utilizes direct, secure connectivity to Google Cloud SQL:
 
 ```
-+-----------------------------------+
-| Cloud Run Container               |
-| (sample-backend)                  |
-+-----------------+-----------------+
-                  |
-                  | Serverless VPC Connector
-                  v
-+--------------------------------------------------------------------------------+
-| Custom VPC Network (Default Subnet: 10.0.0.0/24)                               |
-|                                                                                |
-|  +------------------------------+       +------------------------------------+ |
-|  | Serverless VPC Connector     | ----> | Private Service Connect / PSA      | |
-|  | (e.g. 10.8.0.0/28)           |       | (Allocated IP Range: 10.128.0.0/16)| |
-|  +------------------------------+       +-----------------+------------------+ |
-|                                                           |                    |
-|                                                           v                    |
-|                                         +------------------------------------+ |
-|                                         | Cloud SQL PostgreSQL Instance      | |
-|                                         | (Private IP: 10.128.0.3)           | |
-|                                         +------------------------------------+ |
-+--------------------------------------------------------------------------------+
++-------------------------------------------------------+
+| Cloud Run Service / Job                               |
+| (sample-backend or sample-migration)                  |
+|                                                       |
+|  +-------------------------------------------------+  |
+|  | Cloud SQL Python Connector (Async Driver)       |  |
+|  +------------------------+------------------------+  |
++---------------------------|---------------------------+
+                            |
+                            | Ephemeral mTLS Tunnel
+                            | Port 5432 over Public IPv4
+                            v
++-------------------------------------------------------+
+| Google Cloud SQL PostgreSQL Instance                  |
+| - ipv4_enabled = true                                 |
+| - cloudsql.iam_authentication = "on"                  |
+| - Authorized Networks: Optional CIDR blocks           |
++-------------------------------------------------------+
 ```
 
-### Routing Rules
-- **Private Egress Only:** Cloud Run route settings route traffic destined for private RFC 1918 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) across the VPC connector.
-- **Public Egress:** Outbound requests to external APIs, SMTP mail relays, or public Google APIs (such as Cloud Storage and Secret Manager) travel through Google's default internet gateway.
+### Design Advantages
+- **No VPC Connector Overhead:** Eliminates the latency, throughput bottlenecks, and ongoing idle compute costs associated with Serverless VPC Access connectors.
+- **End-to-End Mutual TLS:** The Cloud SQL Python Connector establishes an ephemeral mutual TLS (mTLS) tunnel directly with the Cloud SQL instance, securing all in-flight traffic.
+- **IAM Authorization:** The connection is authenticated at the database engine level via Google Cloud IAM, requiring no static passwords.
+- **Authorized Networks:** Administrators can optionally specify a list of authorized IPv4 CIDR blocks (`var.authorized_networks`) for maintenance or direct access.
 
-## Cross-Origin Resource Policy (CORS)
+## Cross-Origin Resource Sharing (CORS)
 
-Communication between the frontend SPA (origin: `https://app.example.com`) and backend API (origin: `https://api.example.com`):
-- The FastAPI application configures `CORSMiddleware` with allowed origins matching the frontend domains.
-- Allowed HTTP methods include `GET`, `POST`, `PUT`, `DELETE`, `OPTIONS`.
-- Allowed headers include `Authorization`, `Content-Type`, and standard tracking headers.
+Cross-origin policies are defined at both the backend service and the asset bucket:
+- **Storage Bucket CORS:** The `modules/storage` module configures origin allowances for `https://*.run.app`, custom application domains, and local development (`http://localhost:5173`), permitting `GET`, `PUT`, and `OPTIONS` operations with a 3600-second preflight cache.
+- **Direct Upload Handshake:** Browsers request pre-signed upload URLs from the backend API, perform CORS preflight options requests against Google Cloud Storage, and upload payloads directly to the storage bucket.

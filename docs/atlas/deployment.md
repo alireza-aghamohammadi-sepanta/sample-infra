@@ -1,63 +1,99 @@
 ---
 type: concept
 title: CI/CD and Deployment Workflows
-summary: Continuous integration, multi-stage image builds, environment promotion, and Cloud Run revision rollouts.
-related: ["overview.md", "architecture.md", "compute.md"]
-source_paths: []
+summary: Declarative OpenTofu environment orchestration, API provisioning, migration job execution, and test validation.
+related: ["overview.md", "architecture.md", "compute.md", "database.md"]
+source_paths: [".gitignore", "environments/dev/backend.tf.example", "environments/dev/main.tf", "environments/dev/outputs.tf", "environments/dev/terraform.tfvars.example", "environments/dev/variables.tf", "environments/dev/versions.tf", "tests/test_dev_environment.py"]
 ---
 
 # CI/CD and Deployment Workflows
 
-The deployment workflow standardizes build, validation, database migration, and rollout procedures across all environments. It coordinates artifact generation from application repositories (`sample-backend` and `sample-frontend`) with infrastructure state managed in `sample-infra`.
+Infrastructure deployment in `sample-infra` is managed declaratively using OpenTofu / Terraform. The configuration ties together modular infrastructure components into complete environment instances, coordinates API enablement, manages secrets, and provides execution hooks for database migrations.
 
-## Continuous Deployment Pipeline
+## Environment Orchestration (`environments/dev`)
+
+The development environment definition lives in `environments/dev` and serves as the deployment blueprint:
+
+```
+environments/dev/
+├── versions.tf              # Provider & OpenTofu version constraints
+├── variables.tf             # Input variables (project_id, images, tier, bucket)
+├── main.tf                  # API activation, module wiring, and secrets
+├── outputs.tf               # Exported endpoints, identifiers, and CLI commands
+├── backend.tf.example       # Template for migrating to remote GCS state
+└── terraform.tfvars.example # Template for local environment variable overrides
+```
+
+### 1. Provider & Version Constraints
+`versions.tf` pins minimum versions to guarantee consistent execution:
+- OpenTofu / Terraform `>= 1.6.0`
+- HashiCorp Google provider `~> 5.0`
+- HashiCorp Random provider `>= 3.0`
+
+### 2. Declarative GCP API Enablement
+Before any infrastructure module can provision resources, `main.tf` enables all required Google Cloud APIs via `google_project_service` with `disable_on_destroy = false` and `disable_dependent_services = false`:
+- `run.googleapis.com` (Cloud Run Admin API)
+- `sqladmin.googleapis.com` (Cloud SQL Admin API)
+- `storage.googleapis.com` (Cloud Storage API)
+- `secretmanager.googleapis.com` (Secret Manager API)
+- `iam.googleapis.com` (Identity and Access Management API)
+
+All modules explicitly depend on `google_project_service.services`.
+
+### 3. Module Composition Pipeline
+`environments/dev/main.tf` wires the underlying modules together:
+1. **IAM Module (`modules/iam`):** Provisions `sa-backend`, `sa-frontend`, and `sa-migrator` service accounts with least-privilege roles.
+2. **Cloud SQL Module (`modules/cloudsql`):** Creates the PostgreSQL 16 database instance and registers IAM database users.
+3. **Storage Module (`modules/storage`):** Creates the GCS bucket (`<project_id>-assets`) with `force_destroy = true` for easy cleanups in development.
+4. **Secret Manager Secrets:**
+   - Generates a 32-character random string via `random_password.jwt_secret` and saves it to secret `JWT_SECRET`.
+   - Saves the Cloud SQL connection string (`module.cloudsql.instance_connection_name`) to secret `DATABASE_INSTANCE`.
+5. **Cloud Run Module (`modules/cloudrun`):** Deploys the frontend and backend services along with the schema migration job, passing database connection strings and bucket names into container environments.
+
+## Deployment Lifecycle & Database Migrations
 
 ```
 +--------------------+        +--------------------+        +--------------------+
-|  1. Code Commit    | -----> |  2. Build & Test   | -----> | 3. Publish Image   |
-|  - PR Merge to dev |        |  - Pytest / Vitest |        |  - Google Artifact |
-|    or main branch  |        |  - Multi-stage OCI |        |    Registry (GAR)  |
-+--------------------+        +--------------------+        +---------+----------+
-                                                                      |
-                                                                      v
-+--------------------+        +--------------------+        +--------------------+
-| 6. Complete        | <----- | 5. Deploy Revision | <----- | 4. Run Migrations  |
-|  - 100% Traffic    |        |  - Cloud Run Apply |        |  - Cloud Run Job   |
-|  - Old Rev Scaled  |        |  - Canary / Health |        |  - Alembic Head    |
+| 1. Apply Infra     | -----> | 2. Run Migrations  | -----> | 3. Verify Services |
+|  - tofu apply      |        |  - gcloud run jobs |        |  - frontend_url    |
+|  - Enables APIs    |        |    execute         |        |  - backend_url     |
+|  - Creates Mod Res |        |    sample-migration|        |                    |
 +--------------------+        +--------------------+        +--------------------+
 ```
 
-### Pipeline Stages
+### Triggering Schema Migrations
+The dev environment exports a helper output `migration_job_execute_command`:
+```bash
+gcloud run jobs execute sample-migration --region us-central1 --project <project_id>
+```
+Executing this command launches the `google_cloud_run_v2_job.migration` resource, which runs `alembic upgrade head` under the `sa-migrator` identity before traffic reaches updated application code.
 
-1. **Continuous Integration & Testing:**
-   - Every commit triggers automated linters, type checks (`tsc`, `mypy`), and test suites (`vitest`, `pytest`).
-2. **Container Artifact Generation:**
-   - The backend uses a multi-stage Docker build with Astral `uv` to produce an image based on Python 3.13-bookworm-slim.
-   - The frontend compiles TypeScript and React into static distribution files and packages them into an unprivileged Nginx image.
-   - Images are tagged with git commit SHAs and pushed to Google Artifact Registry.
-3. **Database Schema Migration:**
-   - Prior to serving user traffic with new code, a Google Cloud Run Job invokes `alembic upgrade head`.
-   - If migrations fail, the deployment halts, preventing application crashes due to schema mismatch.
-4. **Cloud Run Revision Rollout:**
-   - Cloud Run provisions a new immutable revision using the freshly published container image.
-   - Startup probes verify container readiness before traffic is shifted.
-5. **Traffic Allocation & Rollback:**
-   - By default, traffic shifts to 100% upon successful startup.
-   - For major releases, canary traffic splitting (e.g. 10% to new revision, 90% to stable revision) validates performance in production.
-   - If errors occur, rolling back is instant by reallocating 100% traffic to the preceding healthy revision.
+## State Management
 
-## Environment Segregation
+By default, local state is excluded from version control via `.gitignore`. For collaborative team environments, state is stored in a remote GCS bucket:
+1. A GCS bucket is provisioned with Object Versioning and Uniform Bucket-Level Access.
+2. `backend.tf.example` is copied to `backend.tf`:
+   ```terraform
+   terraform {
+     backend "gcs" {
+       bucket = "my-dev-tfstate-bucket"
+       prefix = "terraform/state/dev"
+     }
+   }
+   ```
+3. Running `tofu init -migrate-state` migrates state from local disk to the GCS bucket.
 
-The infrastructure architecture supports three isolated environments:
+## Testing & Validation Strategy
 
-| Environment | Purpose | Database Configuration | Compute Scaling |
-| :--- | :--- | :--- | :--- |
-| **Development (`dev`)** | Feature development and continuous testing | Single-zone Cloud SQL, shared micro instance | Scale-to-zero (`min_instances = 0`) |
-| **Staging (`stage`)** | Pre-production validation and integration | Single-zone Cloud SQL with production-like schema | Scale-to-zero with scheduled warm-up |
-| **Production (`prod`)** | Live end-user traffic | Multi-zone Cloud SQL High Availability with PITR | Dedicated warm instance (`min_instances = 1+`) |
+The repository maintains an automated testing pyramid:
 
-## Infrastructure as Code (IaC) Management
+1. **OpenTofu Test Framework (`*.tftest.hcl`):**
+   - Located in `modules/*/tests/`.
+   - Utilizes `mock_provider "google"` to execute declarative plan assertions without contacting cloud APIs.
+   - Asserts port configurations, role assignments, username suffix trimming, and scaling parameters.
 
-Infrastructure resources (VPC, Cloud SQL, Cloud Storage buckets, Secret Manager secrets, and IAM service accounts) are maintained declaratively:
-- **State Storage:** Remote state stored in a dedicated Google Cloud Storage bucket with object versioning and state locking.
-- **Auditability:** All infrastructure changes are peer-reviewed via pull requests, and automated speculative plans are executed before applying changes.
+2. **Python Unit & Contract Tests (`tests/test_*.py`):**
+   - Validates that modules and environment configurations declare all required variables without defaults.
+   - Enforces that no static passwords exist anywhere in the code.
+   - Enforces that Serverless VPC Access connectors are not introduced.
+   - Executes `tofu fmt -check`, `tofu init -backend=false`, and `tofu validate` on all modules and environments.

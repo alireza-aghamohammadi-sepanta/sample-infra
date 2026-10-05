@@ -1,63 +1,96 @@
 ---
 type: concept
 title: Relational Database Infrastructure
-summary: Managed Cloud SQL PostgreSQL provisioning, IAM database authentication, automated backups, and private network integration.
-related: ["architecture.md", "compute.md", "security.md"]
-source_paths: []
+summary: Managed Cloud SQL PostgreSQL provisioning with IAM database authentication and zero static passwords.
+related: ["architecture.md", "compute.md", "security.md", "networking.md"]
+source_paths: ["modules/cloudsql/main.tf", "modules/cloudsql/variables.tf", "modules/cloudsql/outputs.tf", "modules/cloudsql/tests/cloudsql_validation.tftest.hcl", "tests/test_cloudsql_module.py"]
 ---
 
 # Relational Database Infrastructure
 
-The relational persistence tier is powered by **Google Cloud SQL for PostgreSQL**. It houses relational entities such as user accounts, authentication tokens, todo items, and asset metadata. The database architecture emphasizes automated failover, data durability, and passwordless IAM-mediated access controls.
+The relational persistence tier is managed by `modules/cloudsql`. It automates the provisioning of Google Cloud SQL for PostgreSQL instances with strict security baselines, automatic disk management, and native Cloud IAM database authentication.
 
 ## Engine & Instance Specifications
 
-- **Database Engine:** PostgreSQL 16
-- **Storage Type:** SSD (Solid State Drive) persistent storage with automatic capacity expansion enabled.
-- **High Availability (HA):**
-  - *Production:* Regional high-availability deployment with automatic failover across multiple availability zones within the chosen Google Cloud region.
-  - *Development / Staging:* Single-zone configuration to minimize resource costs.
-- **Connection Flags:** Optimized connection parameters, timezone setting (`UTC`), and SSL enforcement (`sslmode=require`).
+- **Database Engine:** PostgreSQL 16 (`POSTGRES_16` default in `var.database_version`).
+- **Storage Profile:** SSD persistent storage (`PD_SSD`) with dynamic auto-resize (`disk_autoresize = true`).
+- **Availability:** Configurable via `availability_type` (`ZONAL` default for development, `REGIONAL` for high-availability production environments).
+- **Network Interface:** Public IPv4 connectivity enabled (`ipv4_enabled = true`) under `ip_configuration`, allowing connections via Cloud SQL Connector and optional CIDR ranges specified in `var.authorized_networks`. No Serverless VPC Access connector is required.
+- **Deletion Protection:** Configurable boolean (`deletion_protection = false` by default for development environments).
 
-## Connection Architecture & IAM Authentication
+## Passwordless IAM Authentication
 
-To eliminate the risks associated with static credentials and rotated passwords, the infrastructure leverages **Cloud SQL IAM Database Authentication**:
+A core security tenet of the Cloud SQL module is the total absence of static database passwords:
+- No `password` or `root_password` attributes exist in any resource declaration or variable block.
+- The instance enables IAM authentication flag `cloudsql.iam_authentication = "on"`.
+- Dedicated `google_sql_user` resources are provisioned for both the application runtime and schema migration workloads:
+
+```terraform
+resource "google_sql_user" "backend" {
+  name     = trimsuffix(var.backend_sa_email, ".gserviceaccount.com")
+  instance = google_sql_database_instance.default.name
+  type     = "CLOUD_IAM_SERVICE_ACCOUNT"
+  project  = var.project_id
+}
+
+resource "google_sql_user" "migrator" {
+  name     = trimsuffix(var.migrator_sa_email, ".gserviceaccount.com")
+  instance = google_sql_database_instance.default.name
+  type     = "CLOUD_IAM_SERVICE_ACCOUNT"
+  project  = var.project_id
+}
+```
+
+Google Cloud SQL requires that IAM database usernames omit the `.gserviceaccount.com` domain suffix (e.g. `sa-backend@project-id.iam`). The module handles this normalization automatically via `trimsuffix`.
+
+## Database Provisioning
+
+The default relational database schema is created via `google_sql_database.default` using the name supplied in `var.database_name` (e.g. `sampledb` or `postgres`).
 
 ```
 +-----------------------------------+             +----------------------------------+
 | Backend Service Account           |             | Google Cloud SQL Instance        |
-| (sample-backend@proj.iam.gservice)|             | (PostgreSQL 16)                  |
+| (sa-backend@proj.iam.gservice)    |             | (PostgreSQL 16, PD_SSD)          |
 +-----------------+-----------------+             +-----------------+----------------+
                   |                                                 ^
-                  | 1. Request Ephemeral Connect Certificate        |
+                  | 1. Cloud SQL Connector Request                  |
                   v                                                 |
 +-----------------------------------+                               |
 | Cloud SQL Admin API               |                               |
+| - Verifies IAM DB User Permission |                               |
+| - Issues Ephemeral mTLS Cert      |                               |
 +-----------------+-----------------+                               |
                   |                                                 |
-                  | 2. Validated IAM Identity & Short-lived Cert    |
-                  v                                                 |
-+-----------------------------------+                               |
-| Cloud SQL Python Connector        +-------------------------------+
-| (mTLS Tunnel & IAM DB User Auth)  |  3. Encrypted Database Session
-+-----------------------------------+
+                  | 2. Connect over TLS / Port 5432                 |
+                  +-------------------------------------------------+
 ```
 
-### Advantages of IAM Database Auth
-- **Zero Static Passwords:** The backend service account authenticates using short-lived credentials generated dynamically by the Cloud SQL Admin API.
-- **Built-in Mutual TLS:** All connections established through the Cloud SQL Python Connector or Cloud SQL Auth Proxy are encrypted end-to-end via ephemeral SSL certificates.
-- **Granular Access Revocation:** Database access is governed centrally via GCP IAM roles (`roles/cloudsql.client` and `roles/cloudsql.instanceUser`).
+## Module Inputs & Outputs
 
-## Backup & Recovery Architecture
+### Required Input Variables
+- `project_id` (string): GCP project ID.
+- `region` (string): GCP region (e.g. `us-central1`).
+- `tier` (string): Machine shape (e.g. `db-f1-micro` for dev, `db-custom-2-7680` for production).
+- `database_name` (string): Relational database name.
+- `backend_sa_email` (string): Backend application service account email.
+- `migrator_sa_email` (string): Migration job service account email.
 
-Data durability and disaster recovery SLAs are maintained through:
-- **Automated Daily Backups:** Point-in-time snapshots captured during off-peak operational windows with a minimum retention period of 7 days (30 days for production).
-- **Point-in-Time Recovery (PITR):** Write-Ahead Logging (WAL) archiving enabled, permitting granular restoration of database state to any specific second within the retention window.
-- **Storage Auto-Resize:** Dynamically expands storage volume before capacity reaches 80% utilization, preventing database write freezes caused by full disks.
+### Optional Input Variables
+- `instance_name` (string, default: `null`): Custom instance name override (defaults to `"${var.database_name}-instance"`).
+- `database_version` (string, default: `"POSTGRES_16"`): PostgreSQL engine version.
+- `availability_type` (string, default: `"ZONAL"`): `ZONAL` or `REGIONAL`.
+- `deletion_protection` (bool, default: `false`): Deletion protection toggle.
+- `authorized_networks` (list(object), default: `[]`): Authorized CIDR blocks for direct connections.
 
-## Database Migrations Pipeline
+### Module Outputs
+- `instance_connection_name`: Full connection string formatted as `project:region:instance`.
+- `instance_name`: The Cloud SQL instance name.
+- `public_ip_address`: Assigned public IPv4 address.
+- `database_name`: Created database name.
+- `backend_db_user`: The trimmed IAM database username for the backend.
+- `migrator_db_user`: The trimmed IAM database username for the migration job.
 
-Schema changes are managed through Alembic migration scripts defined in the backend repository. In cloud environments:
-1. Migrations are executed as isolated **Google Cloud Run Jobs** prior to deploying new application revisions.
-2. The migration job runs with elevated schema-migration database privileges.
-3. Once the migration job reports zero exit status, traffic is migrated to the new backend service revision.
+## Validation & Testing
+
+- **OpenTofu Test Suite** (`modules/cloudsql/tests/cloudsql_validation.tftest.hcl`): Mocks the Google provider to verify database name propagation and IAM username suffix trimming.
+- **Python Integration Tests** (`tests/test_cloudsql_module.py`): Validates required inputs without defaults, ensures static passwords are omitted, confirms SSD storage and auto-resize, verifies `cloudsql.iam_authentication` flag, and tests formatting/validation via OpenTofu.

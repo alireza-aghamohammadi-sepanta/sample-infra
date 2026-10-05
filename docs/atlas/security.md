@@ -1,82 +1,95 @@
 ---
 type: concept
 title: IAM, Secrets, and Security Architecture
-summary: Principle of least privilege, service account roles, Secret Manager secrets injection, and security boundary enforcement.
-related: ["architecture.md", "database.md", "storage.md", "compute.md"]
-source_paths: []
+summary: Least-privilege IAM service accounts, passwordless database authentication, and Secret Manager integration.
+related: ["architecture.md", "compute.md", "database.md", "storage.md"]
+source_paths: ["modules/iam/main.tf", "modules/iam/variables.tf", "modules/iam/outputs.tf", "modules/iam/tests/iam_validation.tftest.hcl", "tests/test_iam_module.py"]
 ---
 
 # IAM, Secrets, and Security Architecture
 
-The security architecture of `sample-infra` implements defense-in-depth across identity, network, data, and secret boundaries. It strictly adheres to the principle of least privilege, eliminates hardcoded credentials, and automates secret provisioning through managed GCP services.
+The security architecture of `sample-infra` implements defense-in-depth across identity, database authentication, storage authorization, and secret injection. It strictly follows the principle of least privilege, eliminating long-lived credentials and enforcing declarative role bindings.
 
-## Identity & Access Management (IAM)
+## Workload Service Accounts & Role Bindings
 
-Each workload runs under a dedicated Google Service Account (GSA) with bounded, resource-level role bindings:
+The `modules/iam` module establishes dedicated Google Service Accounts (GSAs) and project-level IAM role memberships for each distinct system workload:
 
 ```
 +-----------------------------------------------------------------------------------------+
 |                                    Workload Identities                                  |
 +-----------------------------------------------------------------------------------------+
 | Backend Service Account           | Cloud SQL Client (`roles/cloudsql.client`)          |
-| (sa-backend@proj.iam.gservice)    | Cloud SQL Instance User (`roles/cloudsql.instanceUser`)|
-|                                   | Storage Object Admin (`roles/storage.objectAdmin`)  |
+| (sa-backend)                      | Cloud SQL Instance User (`roles/cloudsql.instanceUser`)|
 |                                   | Secret Manager Accessor (`roles/secretmanager.secretAccessor`)|
-+-----------------------------------+-----------------------------------------------------+
-| Frontend Service Account          | Minimal Base Execution (`roles/run.invoker`)         |
-| (sa-frontend@proj.iam.gservice)   | No access to Database, Storage, or Secrets          |
+|                                   | Storage Object Admin (`roles/storage.objectAdmin`)  |
 +-----------------------------------+-----------------------------------------------------+
 | Migration Job Service Account     | Cloud SQL Client (`roles/cloudsql.client`)          |
-| (sa-migrator@proj.iam.gservice)   | Cloud SQL Admin (`roles/cloudsql.admin` / DB owner) |
-|                                   | Secret Manager Accessor                             |
+| (sa-migrator)                     | Cloud SQL Instance User (`roles/cloudsql.instanceUser`)|
+|                                   | Secret Manager Accessor (`roles/secretmanager.secretAccessor`)|
 +-----------------------------------+-----------------------------------------------------+
-| Deployment CI/CD Account          | Cloud Run Developer (`roles/run.developer`)         |
-| (sa-deployer@proj.iam.gservice)   | Artifact Registry Writer (`roles/artifactregistry.writer`)|
-|                                   | Service Account User (`roles/iam.serviceAccountUser`)|
+| Frontend Service Account          | Cloud Run Invoker (`roles/run.invoker`)             |
+| (sa-frontend)                     | (No access to Database, Secrets, or Object Storage) |
 +-----------------------------------------------------------------------------------------+
 ```
 
-### Granular Resource Boundaries
-- Service accounts are not granted project-wide permissions. Storage roles are bound directly to the application bucket (`gs://<PROJECT_ID>-assets`).
-- Secret Manager accessor permissions are scoped to specific secret resource IDs rather than all secrets in the project.
+### Least Privilege Boundaries
+- **sa-backend:** Granted access to query Cloud SQL via IAM DB auth, retrieve secrets from Secret Manager, and generate V4 pre-signed URLs or mutate objects in the storage bucket.
+- **sa-migrator:** Granted minimal rights needed to execute database schema updates (`roles/cloudsql.client`, `roles/cloudsql.instanceUser`, and `roles/secretmanager.secretAccessor`). It does not hold project administrative rights or storage permissions.
+- **sa-frontend:** Restricted to basic execution privileges (`roles/run.invoker`). It cannot query the database, access secret payloads, or touch object storage.
 
 ## Secret Management
 
-Application secrets are managed centrally through **Google Cloud Secret Manager**. This prevents credentials from entering source control, build artifacts, or plain-text environment variables.
+Sensitive runtime parameters are provisioned in Google Cloud Secret Manager (configured in `environments/dev/main.tf`):
 
 ```
-+----------------------------------+
-|   Google Cloud Secret Manager    |
-|                                  |
-|   - JWT_SECRET                   |
-|   - SMTP_HOST / SMTP_PORT        |
-|   - SMTP_USER / SMTP_PASSWORD    |
-|   - DATABASE_URL (Fallback)      |
-+-----------------+----------------+
-                  |
-                  | Secret Manager API
-                  | (Fetch on Startup)
-                  v
-+----------------------------------+
-|      FastAPI Backend Process     |
-|      (app/core/config.py)        |
-+----------------------------------+
++-----------------------------------------+
+|       Google Cloud Secret Manager       |
++-----------------------------------------+
+| 1. JWT_SECRET                           |
+|    - 32-character cryptographic string  |
+|    - Generated via random_password      |
+|    - Stored in automatic replication    |
++-----------------------------------------+
+| 2. DATABASE_INSTANCE                    |
+|    - Cloud SQL connection identifier    |
+|    - Sourced from module.cloudsql       |
++-----------------------------------------+
 ```
 
-### Secret Resolution Order
-The backend uses a cascading resolution workflow:
-1. **Local Environment:** Checks for OS environment variables (ideal for local development and unit tests).
-2. **Secret Manager Fallback:** If an environment variable is omitted and the application runs in GCP, the `google-cloud-secret-manager` client fetches the latest active secret version using the container's service account identity.
+Workloads retrieve these secrets during startup or bootstrap lifespan via the `secretmanager.secretAccessor` role.
 
-## Network & Application Security Controls
+## Zero Static Passwords Policy
 
-1. **Transport Encryption:**
-   - All inbound traffic to Cloud Run services is forced to HTTPS over TLS 1.2/1.3 with Google-managed certificates.
-   - Internal traffic between Cloud Run and Cloud SQL is encrypted via mutual TLS tunnels managed by the Cloud SQL Connector.
+Across the entire infrastructure codebase:
+- Relational database connections do not use static passwords or database credentials.
+- Cloud SQL enables IAM authentication (`cloudsql.iam_authentication = "on"`).
+- Both `sa-backend` and `sa-migrator` authenticate to PostgreSQL using short-lived OAuth tokens issued through the Cloud SQL Admin API and Cloud SQL Python Connector.
+- Tests continuously assert that no `password` or `root_password` attributes exist in modules or environment definitions.
 
-2. **Frontend Security Headers:**
-   Nginx is configured to inject mandatory HTTP response security headers:
-   - `Content-Security-Policy (CSP)`: Restricts script, style, and media sources to trusted origins.
-   - `Strict-Transport-Security (HSTS)`: Forces browsers to use HTTPS for future interactions (`max-age=31536000; includeSubDomains`).
-   - `X-Content-Type-Options: nosniff`: Prevents MIME-sniffing exploits.
-   - `X-Frame-Options: SAMEORIGIN`: Protects against clickjacking.
+## Public Invoker Boundaries
+
+Public internet access to the frontend web application and backend API is controlled via Cloud Run IAM members:
+- `google_cloud_run_v2_service_iam_member.backend_invoker` binds `roles/run.invoker` to `allUsers`.
+- `google_cloud_run_v2_service_iam_member.frontend_invoker` binds `roles/run.invoker` to `allUsers`.
+- Deployed services run in isolated sandboxed microVMs managed by Cloud Run.
+
+## Module Inputs & Outputs
+
+### Input Variables
+- `project_id` (string, required): The target GCP project identifier.
+
+### Module Outputs
+- `backend_sa_email`: Email address for `sa-backend`.
+- `backend_sa_id`: Fully qualified ID for `sa-backend`.
+- `backend_sa_unique_id`: Unique numerical ID for `sa-backend`.
+- `frontend_sa_email`: Email address for `sa-frontend`.
+- `frontend_sa_id`: Fully qualified ID for `sa-frontend`.
+- `frontend_sa_unique_id`: Unique numerical ID for `sa-frontend`.
+- `migrator_sa_email`: Email address for `sa-migrator`.
+- `migrator_sa_id`: Fully qualified ID for `sa-migrator`.
+- `migrator_sa_unique_id`: Unique numerical ID for `sa-migrator`.
+
+## Validation & Testing
+
+- **OpenTofu Test Suite** (`modules/iam/tests/iam_validation.tftest.hcl`): Verifies that service account outputs are non-empty during mock plan evaluation.
+- **Python Integration Tests** (`tests/test_iam_module.py`): Verifies `project_id` is required without default, confirms service account names and least-privilege role mappings, and validates module syntax with OpenTofu.
